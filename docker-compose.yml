@@ -1,0 +1,51 @@
+# Pinned n8n Community Edition + the FastAPI mock stack.
+# n8n reaches the mocks at http://mock-apis:8000 on this compose network.
+# Pin is 2.42.6 (stable per https://github.com/n8n-io/n8n/releases, 2026-10-09).
+services:
+  n8n:
+    image: n8nio/n8n:2.42.6
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_SECURE_COOKIE=false
+      - GENERIC_TIMEZONE=Europe/Amsterdam
+      - MOCK_APIS_BASE_URL=http://mock-apis:8000
+      - API_KEY_RW=${API_KEY_RW:-rw-dev-local-change-me}
+      - API_KEY_RO=${API_KEY_RO:-ro-dev-local-change-me}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-haiku-4-5-20251001}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/workflows
+    depends_on:
+      mock-apis:
+        condition: service_healthy
+
+  mock-apis:
+    build:
+      context: .
+      dockerfile: mock_apis/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - API_KEY_RW=${API_KEY_RW:-rw-dev-local-change-me}
+      - API_KEY_RO=${API_KEY_RO:-ro-dev-local-change-me}
+      - FAULT_RATE=${FAULT_RATE:-0.0}
+      - RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-5}
+      - DB_PATH=/data/lab.db
+    volumes:
+      - mock_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').getcode()==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  n8n_data:
+  mock_data:

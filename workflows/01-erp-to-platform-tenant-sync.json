@@ -1,0 +1,324 @@
+{
+  "name": "erp-to-platform-tenant-sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000001",
+      "name": "Every 15 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 240]
+    },
+    {
+      "parameters": {},
+      "id": "0a1a1a01-0000-4000-8000-000000000002",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 420]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "erp-tenant-changed",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000003",
+      "name": "Webhook: tenant changed",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 600],
+      "webhookId": "erp-tenant-changed"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read-only step: get the watermark used for the next ERP fetch.\n// The webhook can override via body.updated_since; the scheduled run uses workflow static data.\nconst staticData = $getWorkflowStaticData('global');\nconst fromItem = $input.first()?.json ?? {};\nconst override = fromItem.updated_since ?? fromItem.body?.updated_since;\nconst watermark = override || staticData.lastSyncedAt || '1970-01-01T00:00:00Z';\nreturn [{ json: { updated_since: watermark } }];\n"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000010",
+      "name": "Get watermark",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 420]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.MOCK_APIS_BASE_URL || 'http://mock-apis:8000' }}/erp/v1/huurders",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "updated_since",
+              "value": "={{ $json.updated_since }}"
+            }
+          ]
+        },
+        "sendHeaders": false,
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000011",
+      "name": "Fetch ERP tenants",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 420],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "continueOnFail": false,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "mock-apis-rw",
+          "name": "mock-apis X-API-Key (RW)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Explode: one n8n item per tenant row.\nconst payload = $input.first().json;\nconst rows = payload.huurders ?? [];\nreturn rows.map(r => ({ json: r }));\n"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000012",
+      "name": "Explode rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [920, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map ERP (Dutch, NL locale) -> canonical platform schema. See docs/mapping.md.\n// Output ONE item per input row. On failure, set $json._invalid with a rejection code so the IF node can split.\nconst STATUS = { actief: 'active', beeindigd: 'ended', 'beëindigd': 'ended' };\n\nfunction stripToDigits(s) { return (s || '').replace(/\\D+/g, ''); }\nfunction parseDutchAmount(s) {\n  if (s == null) return NaN;\n  const t = String(s).trim().replace(/[^0-9,.\\-]/g, '');\n  // Thousands dot, decimal comma: \"1.250,00\" -> \"1250.00\"\n  return Number(t.replace(/\\./g, '').replace(',', '.'));\n}\nfunction parseDDMMYYYY(s) {\n  if (!s) return null;\n  const m = String(s).match(/^(\\d{2})-(\\d{2})-(\\d{4})$/);\n  if (!m) return null;\n  const [_, dd, mm, yyyy] = m;\n  const iso = `${yyyy}-${mm}-${dd}`;\n  const d = new Date(iso + 'T00:00:00Z');\n  if (Number.isNaN(d.getTime())) return null;\n  // Reject rolls like 32-01-2024 by round-tripping.\n  if (d.toISOString().slice(0, 10) !== iso) return null;\n  return iso;\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const r = item.json;\n  const errors = [];\n\n  const name = (r.naam ?? '').toString().trim();\n  if (!name) errors.push('missing_name');\n\n  const kvk = stripToDigits(r.kvk_nummer);\n  if (!/^\\d{8}$/.test(kvk)) errors.push('invalid_kvk');\n\n  const leaseStart = parseDDMMYYYY(r.contract_start);\n  if (!leaseStart) errors.push('invalid_date');\n\n  const rent = parseDutchAmount(r.maandhuur);\n  if (!Number.isFinite(rent) || rent < 0) errors.push('invalid_amount');\n\n  const canonicalStatus = STATUS[(r.status ?? '').toString().toLowerCase()];\n  if (!canonicalStatus) errors.push('unknown_status');\n\n  if (errors.length) {\n    out.push({ json: { _invalid: true, _codes: errors, source_row: r } });\n    continue;\n  }\n\n  out.push({\n    json: {\n      _invalid: false,\n      external_id: r.huurder_id,\n      name,\n      chamber_of_commerce_id: kvk,\n      unit: r.unit_code,\n      lease_start: leaseStart,\n      monthly_rent_eur: rent,\n      status: canonicalStatus,\n      _gewijzigd_op: r.gewijzigd_op,\n      source_row: r,\n    },\n  });\n}\nreturn out;\n"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000013",
+      "name": "Map & validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1140, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._invalid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000014",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1360, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MOCK_APIS_BASE_URL || 'http://mock-apis:8000' }}/platform/v1/tenants",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  external_id: $json.external_id,\n  name: $json.name,\n  chamber_of_commerce_id: $json.chamber_of_commerce_id,\n  unit: $json.unit,\n  lease_start: $json.lease_start,\n  monthly_rent_eur: $json.monthly_rent_eur,\n  status: $json.status\n} }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1500
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000015",
+      "name": "Upsert tenant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 320],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "mock-apis-rw",
+          "name": "mock-apis X-API-Key (RW)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// After the POST we always continue (neverError=true). Classify the response:\n//   2xx: upserted; update watermark high-watermark.\n//   4xx (409 / 422): persistent, report to integration-errors.\n//   429 / 5xx after retries: report as transient.\nconst item = $input.first().json;\nconst status = item.statusCode ?? item.status ?? 0;\nconst body = item.body ?? item;\nif (status >= 200 && status < 300) {\n  return [{ json: { ok: true, external_id: body.external_id, gewijzigd_op: $('Map & validate').item?.json?._gewijzigd_op } }];\n}\nlet code = 'platform_422';\nif (status === 409) code = 'external_id_conflict';\nelse if (status === 429) code = 'rate_limit';\nelse if (status >= 500) code = 'platform_5xx';\nconst source = $('Map & validate').item.json.source_row;\nreturn [{ json: { ok: false, source: 'erp-to-platform-tenant-sync', http_status: status,\n                   error_body: JSON.stringify(body), payload: source, code } }];\n"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000016",
+      "name": "Classify response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1860, 320]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000017",
+      "name": "Upsert OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2080, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a report body for /platform/v1/integration-errors.\n// Works both for validation-rejected rows (from the Valid? false branch)\n// and HTTP failures (from Classify response).\nconst j = $json;\nconst payload = j.source_row ? j.source_row : j.payload;\nconst http_status = j.http_status ?? (j._invalid ? 422 : null);\nconst error_body = j._invalid\n  ? JSON.stringify({ error: 'validation', codes: j._codes })\n  : (j.error_body || '');\nreturn [{ json: {\n  source: 'WF1: erp-to-platform-tenant-sync',\n  payload,\n  http_status,\n  error_body,\n} }];\n"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000020",
+      "name": "Build error record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1620, 640]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MOCK_APIS_BASE_URL || 'http://mock-apis:8000' }}/platform/v1/integration-errors",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000021",
+      "name": "Report error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1860, 640],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "mock-apis-rw",
+          "name": "mock-apis X-API-Key (RW)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Watermark advance: when at least one row upserted OK, set lastSyncedAt to the max\n// gewijzigd_op of the successful rows. Rejected rows do NOT advance the watermark\n// so they re-queue on the next run (and get re-reported as 'duplicate' events on the error log).\nconst staticData = $getWorkflowStaticData('global');\nlet maxWm = staticData.lastSyncedAt || '1970-01-01T00:00:00Z';\nfor (const it of $input.all()) {\n  const t = it.json.gewijzigd_op;\n  if (t && t > maxWm) maxWm = t;\n}\nstaticData.lastSyncedAt = maxWm;\nreturn [{ json: { watermark_now: maxWm, count: $input.all().length } }];\n"
+      },
+      "id": "0a1a1a01-0000-4000-8000-000000000018",
+      "name": "Advance watermark",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2300, 220]
+    }
+  ],
+  "connections": {
+    "Every 15 min": {
+      "main": [[{ "node": "Get watermark", "type": "main", "index": 0 }]]
+    },
+    "Manual Run": {
+      "main": [[{ "node": "Get watermark", "type": "main", "index": 0 }]]
+    },
+    "Webhook: tenant changed": {
+      "main": [[{ "node": "Get watermark", "type": "main", "index": 0 }]]
+    },
+    "Get watermark": {
+      "main": [[{ "node": "Fetch ERP tenants", "type": "main", "index": 0 }]]
+    },
+    "Fetch ERP tenants": {
+      "main": [[{ "node": "Explode rows", "type": "main", "index": 0 }]]
+    },
+    "Explode rows": {
+      "main": [[{ "node": "Map & validate", "type": "main", "index": 0 }]]
+    },
+    "Map & validate": {
+      "main": [[{ "node": "Valid?", "type": "main", "index": 0 }]]
+    },
+    "Valid?": {
+      "main": [
+        [{ "node": "Build error record", "type": "main", "index": 0 }],
+        [{ "node": "Upsert tenant", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upsert tenant": {
+      "main": [[{ "node": "Classify response", "type": "main", "index": 0 }]]
+    },
+    "Classify response": {
+      "main": [[{ "node": "Upsert OK?", "type": "main", "index": 0 }]]
+    },
+    "Upsert OK?": {
+      "main": [
+        [{ "node": "Advance watermark", "type": "main", "index": 0 }],
+        [{ "node": "Build error record", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build error record": {
+      "main": [[{ "node": "Report error", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 3,
+  "versionId": "01000000-0000-4000-8000-000000000000",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

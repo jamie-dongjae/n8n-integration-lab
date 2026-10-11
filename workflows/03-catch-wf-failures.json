@@ -1,0 +1,64 @@
+{
+  "name": "catch-wf-failures",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "0a3a3a03-0000-4000-8000-000000000001",
+      "name": "On workflow error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The Error Trigger fires whenever another workflow throws past its retries.\n// Translate the trigger payload into an integration-errors row so WF2 can triage it.\nconst e = $input.first().json;\nconst exec = e.execution ?? {};\nconst wf = e.workflow ?? {};\nconst lastNode = exec.lastNodeExecuted ?? '';\nconst errMsg = (exec.error && (exec.error.message || exec.error.description)) || 'workflow execution failed';\nreturn [{ json: {\n  source: `n8n:${wf.name || wf.id || 'unknown-wf'} @ ${lastNode}`,\n  payload: { executionId: exec.id, mode: exec.mode, startedAt: exec.startedAt },\n  http_status: null,\n  error_body: String(errMsg).slice(0, 2000),\n} }];\n"
+      },
+      "id": "0a3a3a03-0000-4000-8000-000000000002",
+      "name": "Build error row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MOCK_APIS_BASE_URL || 'http://mock-apis:8000' }}/platform/v1/integration-errors",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {},
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "0a3a3a03-0000-4000-8000-000000000003",
+      "name": "Report to platform",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "mock-apis-rw",
+          "name": "mock-apis X-API-Key (RW)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "On workflow error": {
+      "main": [[{ "node": "Build error row", "type": "main", "index": 0 }]]
+    },
+    "Build error row": {
+      "main": [[{ "node": "Report to platform", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "versionId": "03000000-0000-4000-8000-000000000000",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
