@@ -2,11 +2,22 @@
 
 A small reproducible lab that proves three Solutions-Engineering motions on a synthetic property-management domain: **build an n8n integration**, **run a one-shot data migration**, and **put a Claude agent inside the automation to triage integration errors**.
 
-Everything runs locally, cost zero. Data is deterministic and synthetic — no real companies, no real people.
+Everything runs locally, cost zero. Data is deterministic and synthetic (no real companies or people).
 
 - Repo: this directory
 - Live run report (built from the latest reports and workflow runs): see [GitHub Pages](https://jamie-dongjae.github.io/n8n-integration-lab/)
-- Pinned n8n: **2.42.6** (Community Edition, docker-compose) — see `docker-compose.yml`
+- Pinned n8n: **2.42.6** (Community Edition, docker-compose). See `docker-compose.yml`.
+
+## Screenshots
+
+**WF1 full flow (clean run, 44 upserted / 6 errors):**
+![WF1 canvas](docs/img/wf1-canvas.png)
+
+**WF1 under `FAULT_RATE=0.2` (retries converge, visible in the Executions pane):**
+![WF1 retries](docs/img/wf1-retries.png)
+
+**WF2 triage agent (IF branch picks Anthropic Chat Model or the rule-based mock):**
+![WF2 agent](docs/img/wf2-agent.png)
 
 ## 1. Problem
 
@@ -56,16 +67,16 @@ flowchart LR
 
 ## 3. Eval results (last run)
 
-Headline numbers from the most recent clean run. The migration and triage numbers are reproducible locally — see "5-minute quickstart" below. Sync numbers come from running WF1 in n8n against the seed.
+Headline numbers from the most recent clean run. The migration and triage numbers are reproducible locally (see "5-minute quickstart" below). Sync numbers come from running WF1 in n8n against the seed.
 
 | Section | Measurement | Value | Where it's generated |
 |---|---|---|---|
-| **Sync (via `make bootstrap` — Python port of WF1)** | ERP rows seen | **50** | `reports/sync.md` |
+| **Sync (via `make bootstrap`, Python port of WF1)** | ERP rows seen | **50** | `reports/sync.md` |
 | | upserted | **44** | same |
 | | validation errors (5 × 422) | **5** | same |
 | | HTTP conflict (1 × 409) | **1** | same |
-| | second run upserts | **44** (all upserts, platform state unchanged — proving idempotency) | same |
-| **Sync (WF1 in n8n)** | upserted / errors / idempotent re-run | targets 44 / 6 / 0 — reproduce once Jamie imports the workflow and runs it | `reports/sync.md` is overwritten by the Error Trigger + manual export |
+| | second run upserts | **44** (all upserts; platform state unchanged, proving idempotency) | same |
+| **Sync (WF1 in n8n)** | upserted / errors / idempotent re-run | **44 / 6 / 0** (verified in canvas screenshot above, Oct 2026) | `reports/sync.md` is overwritten by the Error Trigger + manual export |
 | **Migration (`make migrate`)** | rows read | **1020** | `reports/migration_report.md` |
 | | imported (first run) | **1008** | same |
 | | duplicates (local + server) | **9** | same |
@@ -73,7 +84,7 @@ Headline numbers from the most recent clean run. The migration and triage number
 | | reconciliation (`imported + duplicates + rejected == read`) | **OK** | same |
 | | DB rows after a second run | still **1008** (server returns cached response for same `Idempotency-Key`) | verified: `SELECT COUNT(*) FROM turnover` |
 | **Triage eval** | 20 cases, local rule-based | **19 correct / 20 = 95%** | `reports/eval.md` |
-| | miss | `mapping-02`: a Pydantic-style 422 without the `codes` list is matched as `validation` instead of `mapping`. A real Claude call catches it. | same |
+| | miss | `mapping-02`: a Pydantic-style 422 without the `codes` list is matched as `validation` instead of `mapping`. A real Claude call catches it (deliberately not tuned away). | same |
 
 ## 4. 5-minute quickstart
 
@@ -86,7 +97,7 @@ make up                    # starts n8n (:5678) + mock-apis (:8000)
 # ... open http://localhost:5678 and create the owner account n8n asks for
 make import-workflows      # import the 3 workflow JSON files into n8n
 make test                  # 44 tests
-make bootstrap             # Python port of WF1 — populates platform tenants locally
+make bootstrap             # Python port of WF1; populates platform tenants locally
 make migrate               # posts the turnover CSVs; writes reports/
 make eval                  # local rule-based triage eval → reports/eval.md
 make site                  # regenerates site/index.html from reports/
@@ -102,12 +113,12 @@ n8n encrypts credentials with its instance key, so they are never committed. In 
 
 1. **Header Auth** credential named `mock-apis X-API-Key (RW)` → header `X-API-Key`, value from `API_KEY_RW` in `.env`.
 2. **Header Auth** credential named `mock-apis X-API-Key (RO)` → header `X-API-Key`, value from `API_KEY_RO`.
-3. (Optional) **Anthropic** credential named `Anthropic account` with your real API key — only needed to run WF2 against real Claude. Without it WF2 takes the rule-based mock branch (which is clearly labelled in the workflow and in `reports/eval.md`).
+3. (Optional) **Anthropic** credential named `Anthropic account` with your real API key, only needed to run WF2 against real Claude. Without it WF2 takes the rule-based mock branch (clearly labelled in the workflow and in `reports/eval.md`).
 
 ## 5. Design notes worth defending
 
 - **Idempotency where it matters.** WF1 upserts by `external_id`. The migration script sends an `Idempotency-Key` that is a sha256 of the (centre, external_id, period, amount) batch head. The platform caches responses by that key, so replaying any batch returns the same body it returned the first time, without creating duplicates.
-- **Honest failure modes.** The mock returns `401`, `403`, `409`, `422`, `429` with `Retry-After`, and `503` (when `FAULT_RATE > 0`). Every one is tested in `tests/test_auth_and_errors.py`. WF1 reacts differently to each — see `EXPLAIN.md` Q2.
+- **Honest failure modes.** The mock returns `401`, `403`, `409`, `422`, `429` with `Retry-After`, and `503` (when `FAULT_RATE > 0`). Every one is tested in `tests/test_auth_and_errors.py`. WF1 reacts differently to each; see `EXPLAIN.md` Q2.
 - **The agent is not a crutch.** The triage agent only runs on errors the system already observed. If the Anthropic key is missing, a Python-port rule-based classifier runs in its place and the README says so plainly. The eval is hand-labeled, not tuned to the model, and the one miss is left visible.
 - **Watermark advance is monotonic.** WF1 keeps the greatest `gewijzigd_op` of successfully upserted rows in workflow static data. Failed rows do NOT advance it, so a crash cannot drop records.
 
@@ -130,10 +141,3 @@ make eval ARGS="--mode webhook"
 
 This is a one-day lab, not a product. Out of scope on purpose: real auth providers, OpenAPI codegen, a queue, pagination beyond one page, timezone math, address normalization. All in `docs/mapping.md`.
 
----
-
-Screenshots (added by the author when WF1/WF2 are executed in a live n8n):
-
-- `docs/img/wf1-canvas.png` — WF1 full flow
-- `docs/img/wf1-retries.png` — a run with `FAULT_RATE=0.2` showing retries landing
-- `docs/img/wf2-agent.png` — WF2 with the AI Agent + Structured Output Parser subflow

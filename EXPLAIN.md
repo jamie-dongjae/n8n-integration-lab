@@ -4,7 +4,7 @@ Ten questions a reviewer or interviewer is likely to ask about this repo, with s
 
 ## 1. What makes the tenant sync idempotent, and why upsert by `external_id`?
 
-The platform's `POST /platform/v1/tenants` writes with `INSERT ... ON CONFLICT(external_id) DO UPDATE` (see `mock_apis/main.py:upsert_tenant`). `external_id` is the ERP's primary key (`huurder_id`), which is the only identifier guaranteed stable across both systems — names change, units are reassigned, KvK numbers get corrected. Re-running WF1 on the same ERP data produces zero changes, which is the test `tests/test_auth_and_errors.py::test_upsert_is_idempotent_on_same_payload` covers.
+The platform's `POST /platform/v1/tenants` writes with `INSERT ... ON CONFLICT(external_id) DO UPDATE` (see `mock_apis/main.py:upsert_tenant`). `external_id` is the ERP's primary key (`huurder_id`), which is the only identifier guaranteed stable across both systems. Names change, units are reassigned, KvK numbers get corrected. Re-running WF1 on the same ERP data produces zero changes, which is the test `tests/test_auth_and_errors.py::test_upsert_is_idempotent_on_same_payload` covers.
 
 ## 2. How does the workflow react differently to 401, 403, 422, 429 and 503, and why?
 
@@ -49,29 +49,29 @@ The WF1 IF branch catches **expected** failures: the HTTP step completed, we got
 
 ## 8. How does the Claude triage step work, why structured output, and what are the eval's limits?
 
-The **AI Agent** node in WF2 is wired to **Anthropic Chat Model** + a **Structured Output Parser** that forces the response to a fixed JSON shape (`category`, `likely_cause`, `suggested_fix`, `client_message`, `confidence`). Structured output matters because the next node is a plain `PATCH /platform/v1/integration-errors/{id}` — if the LLM free-formed its answer, the PATCH would fail validation.
+The **AI Agent** node in WF2 is wired to **Anthropic Chat Model** + a **Structured Output Parser** that forces the response to a fixed JSON shape (`category`, `likely_cause`, `suggested_fix`, `client_message`, `confidence`). Structured output matters because the next node is a plain `PATCH /platform/v1/integration-errors/{id}`. If the LLM free-formed its answer, the PATCH would fail validation.
 
 Eval limits (why 95% is honest, not generous):
 - Cases are hand-labelled by a human (me), not scraped. 20 cases, ≥2 per category.
-- Cases include one `mapping-02` where the error body has no `codes[]` list, just a Pydantic-style `fields` array. The rule classifier labels it `validation` where a careful human (and Claude) would label it `mapping`. That case is kept intentionally — the eval is not tuned to the model.
+- Cases include one `mapping-02` where the error body has no `codes[]` list, just a Pydantic-style `fields` array. The rule classifier labels it `validation` where a careful human (and Claude) would label it `mapping`. That case is kept intentionally; the eval is not tuned to the model.
 - The eval doesn't measure the quality of `client_message` or `suggested_fix`; those need human review.
 
 ## 9. What would break first at 100x the data volume, and what would you change (pagination, batching, rate limits, queue mode)?
 
 At 100x, three things break roughly in this order:
 
-1. **Fetch** — the ERP endpoint returns everything in one JSON array. Fix: add `page_token` + `size` to `/erp/v1/huurders` and loop in WF1 with a Split-In-Batches node around the HTTP step.
-2. **Rate limit** — the global 5 rps starves parallel runs. Fix: lift to a per-API-key quota on the platform side; add jittered backoff in n8n (set `waitBetweenTries` with a small random offset) to avoid thundering-herd retries.
-3. **Single n8n worker** — a 15-min schedule running tens of thousands of rows in one tick spikes memory. Fix: switch n8n to **queue mode** (Redis + worker pool) and move the per-row Code work into one HTTP step with `send multiple items` to the platform's batch upsert.
+1. **Fetch**: the ERP endpoint returns everything in one JSON array. Fix: add `page_token` + `size` to `/erp/v1/huurders` and loop in WF1 with a Split-In-Batches node around the HTTP step.
+2. **Rate limit**: the global 5 rps starves parallel runs. Fix: lift to a per-API-key quota on the platform side; add jittered backoff in n8n (set `waitBetweenTries` with a small random offset) to avoid thundering-herd retries.
+3. **Single n8n worker**: a 15-min schedule running tens of thousands of rows in one tick spikes memory. Fix: switch n8n to **queue mode** (Redis + worker pool) and move the per-row Code work into one HTTP step with `send multiple items` to the platform's batch upsert.
 
 The migration script is already batched; the only change there would be raising the batch size to the platform's cap and tracking batch-level `Idempotency-Key` in a sidecar table so a resumed run is cheap.
 
 ## 10. A client says "tenant X is missing on the platform". Walk through the debugging steps using this system.
 
-1. Hit `GET /platform/v1/tenants/{external_id}`. If it's there, the complaint is about freshness, not loss — check WF1's last run time and the row's `updated_at`.
+1. Hit `GET /platform/v1/tenants/{external_id}`. If it's there, the complaint is about freshness, not loss. Check WF1's last run time and the row's `updated_at`.
 2. Not there → `GET /platform/v1/integration-errors?status=new` and search by payload. If the row is in that list, read the attached `triage` block for category and client-friendly message.
 3. Still nothing → check that the ERP actually emits it: `GET /erp/v1/huurders?updated_since=1970-01-01` and grep for the `huurder_id`.
 4. If the ERP has it but the sync didn't pick it up, open n8n → executions for `erp-to-platform-tenant-sync` → filter by date around the ERP `gewijzigd_op`. Nothing there means the watermark is wrong; set the webhook payload `{"updated_since":"..."}` to force a resync of that window.
-5. If the sync picked it up but silently dropped it (shouldn't happen — the Error Trigger would have caught it) you reach for the Error Trigger logs via `source LIKE 'n8n:%'` in `integration_errors`.
+5. If the sync picked it up but silently dropped it (shouldn't happen; the Error Trigger would have caught it), reach for the Error Trigger logs via `source LIKE 'n8n:%'` in `integration_errors`.
 
 That's six lookups max, every one a plain HTTP call. The reason that works is point 7 above: expected failures and unexpected failures land in the same table.
